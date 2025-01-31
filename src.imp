@@ -1,0 +1,7 @@
+first :: proc() {
+    first()
+}
+
+main :: proc() {
+    first()
+}
