@@ -1,3 +1,4 @@
+#include "theme.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,6 +6,11 @@
 #include <ctype.h>
 
 // TODO Tail call optimization.
+// TODO Syntax highlighting
+// TODO Scope of Scopes
+// TODO --return-symbol-at POINT
+// TODO Compilers should also be an lsp's
+// TODO Capture tests on the buffer or region
 
 // TODO Frame pointer omission: For simple functions,
 // we could omit the frame pointer (rbp) entirely,
@@ -24,9 +30,15 @@ typedef enum {
 typedef struct {
     size_t row;    // Current line number (1-based)
     size_t col;    // Current column number (1-based)
-    char* source;  // Pointer to the source string
     size_t point;  // Current position in source
 } Cursor;
+
+typedef struct {
+    char *content;   // Text content
+    size_t size;     // Current size of content
+    size_t capacity; // Allocated capacity
+    char *name;      // Buffer name
+} Buffer;
 
 typedef struct {
     TokenType type;
@@ -49,17 +61,18 @@ typedef struct {
 } Procedures;
 
 typedef struct {
+    Buffer buffer;
     Cursor cursor;
     Token current_token;
     Procedures procedures;
-    FILE* output_file; // Assembly output file
+    FILE *output_file; // Assembly output file
 } Compiler;
 
 // Function prototypes
 Cursor cursor_new(const char* source);
-void cursor_advance(Cursor* cursor);
-char cursor_peek(Cursor* cursor);
-bool cursor_is_at_end(Cursor* cursor);
+void cursor_advance(Cursor *cursor, Buffer *buffer);
+char cursor_peek(Cursor *cursor, Buffer *buffer);
+bool cursor_is_at_end(Cursor *cursor, Buffer *buffer);
 Token token_new(TokenType type, const char* lexeme, size_t row, size_t col);
 Procedure* procedure_new(const char* name);
 void procedure_add_call(Procedure* proc, Procedure* called_proc);
@@ -76,14 +89,13 @@ Cursor cursor_new(const char* source) {
     Cursor cursor = {
         .row = 1,
         .col = 1,
-        .source = strdup(source),
         .point = 0
     };
     return cursor;
 }
 
-void cursor_advance(Cursor* cursor) {
-    if (cursor->source[cursor->point] == '\n') {
+void cursor_advance(Cursor* cursor, Buffer *buffer) {
+    if (buffer->content[cursor->point] == '\n') {
         cursor->row++;
         cursor->col = 1;
     } else {
@@ -92,12 +104,12 @@ void cursor_advance(Cursor* cursor) {
     cursor->point++;
 }
 
-char cursor_peek(Cursor* cursor) {
-    return cursor->source[cursor->point];
+char cursor_peek(Cursor* cursor, Buffer *buffer) {
+    return buffer->content[cursor->point];
 }
 
-bool cursor_is_at_end(Cursor* cursor) {
-    return cursor->source[cursor->point] == '\0';
+bool cursor_is_at_end(Cursor* cursor, Buffer *buffer) {
+    return buffer->content[cursor->point] == '\0';
 }
 
 // Token functions
@@ -138,7 +150,13 @@ void procedure_free(Procedure* proc) {
 // Compiler functions
 Compiler *compiler_new(const char *source) {
     Compiler *c = malloc(sizeof(Compiler));
-    c->cursor = cursor_new(source);
+    c->buffer.content = strdup(source);
+    c->buffer.size = strlen(source);
+    c->buffer.capacity = c->buffer.size + 1;
+    c->buffer.name = strdup("source");
+    c->cursor.row = 1;
+    c->cursor.col = 1;
+    c->cursor.point = 0;
     c->procedures.array = NULL;
     c->procedures.num = 0;
     c->procedures.capacity = 0;
@@ -147,7 +165,8 @@ Compiler *compiler_new(const char *source) {
 }
 
 void compiler_free(Compiler *c) {
-    free(c->cursor.source);
+    free(c->buffer.content);
+    free(c->buffer.name);
     for (size_t i = 0; i < c->procedures.num; i++) {
         procedure_free(c->procedures.array[i]);
     }
@@ -163,28 +182,28 @@ void lex(Compiler* c) {
     char lexeme[256];
     size_t lexeme_len = 0;
 
-    while (!cursor_is_at_end(&c->cursor)) {
+    while (!cursor_is_at_end(&c->cursor, &c->buffer)) {
         size_t start_row = c->cursor.row;
         size_t start_col = c->cursor.col;
         lexeme_len = 0;
 
         // Skip whitespace
-        while (isspace(cursor_peek(&c->cursor))) {
-            cursor_advance(&c->cursor);
+        while (isspace(cursor_peek(&c->cursor, &c->buffer))) {
+            cursor_advance(&c->cursor, &c->buffer);
         }
 
-        if (cursor_is_at_end(&c->cursor)) {
+        if (cursor_is_at_end(&c->cursor, &c->buffer)) {
             c->current_token = token_new(TOKEN_EOF, "", start_row, start_col);
             return;
         }
 
-        char ch = cursor_peek(&c->cursor);
+        char ch = cursor_peek(&c->cursor, &c->buffer);
 
         if (isalpha(ch) || ch == '_') {
             // Identifier
-            while (isalnum(cursor_peek(&c->cursor)) || cursor_peek(&c->cursor) == '_') {
-                lexeme[lexeme_len++] = cursor_peek(&c->cursor);
-                cursor_advance(&c->cursor);
+            while (isalnum(cursor_peek(&c->cursor, &c->buffer)) || cursor_peek(&c->cursor, &c->buffer) == '_') {
+                lexeme[lexeme_len++] = cursor_peek(&c->cursor, &c->buffer);
+                cursor_advance(&c->cursor, &c->buffer);
             }
             lexeme[lexeme_len] = '\0';
 
@@ -194,24 +213,24 @@ void lex(Compiler* c) {
                 c->current_token = token_new(TOKEN_IDENTIFIER, lexeme, start_row, start_col);
             }
         } else if (ch == ':') {
-            cursor_advance(&c->cursor);
-            if (cursor_peek(&c->cursor) == ':') {
-                cursor_advance(&c->cursor);
+            cursor_advance(&c->cursor, &c->buffer);
+            if (cursor_peek(&c->cursor, &c->buffer) == ':') {
+                cursor_advance(&c->cursor, &c->buffer);
                 c->current_token = token_new(TOKEN_DOUBLE_COLON, "::", start_row, start_col);
             } else {
                 error(c, "Expected ':' after ':'");
             }
         } else if (ch == '(') {
-            cursor_advance(&c->cursor);
+            cursor_advance(&c->cursor, &c->buffer);
             c->current_token = token_new(TOKEN_LPAREN, "(", start_row, start_col);
         } else if (ch == ')') {
-            cursor_advance(&c->cursor);
+            cursor_advance(&c->cursor, &c->buffer);
             c->current_token = token_new(TOKEN_RPAREN, ")", start_row, start_col);
         } else if (ch == '{') {
-            cursor_advance(&c->cursor);
+            cursor_advance(&c->cursor, &c->buffer);
             c->current_token = token_new(TOKEN_LBRACE, "{", start_row, start_col);
         } else if (ch == '}') {
-            cursor_advance(&c->cursor);
+            cursor_advance(&c->cursor, &c->buffer);
             c->current_token = token_new(TOKEN_RBRACE, "}", start_row, start_col);
         } else {
             error(c, "Unexpected character");
@@ -373,46 +392,269 @@ void error(Compiler* c, const char* message) {
     exit(1);
 }
 
-int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <source_file>\n", argv[0]);
+#include <lume.h>
+
+int sw = 1920;
+int sh = 1080;
+
+void drawCompilerState(Font *font, Compiler *c, int step_count) {
+    char state_info[256];
+    const char *lexeme = "(null)";
+
+    if (c->current_token.lexeme) {
+        lexeme = c->current_token.lexeme;
+    }
+
+    snprintf(state_info, sizeof(state_info),
+             "Step: %d, Token: %s, Line: %zu, Col: %zu", step_count, lexeme,
+             c->cursor.row, c->cursor.col);
+
+    drawText(font, state_info, 10, 40, CT.text);
+}
+
+void drawSourceCode(Font *font, Compiler *c, const char *source) {
+    int start_line = (int)c->cursor.row - 5;
+    if (start_line < 1)
+        start_line = 1;
+    const char *source_ptr = source;
+    for (int i = 1; i < start_line; i++) {
+        source_ptr = strchr(source_ptr, '\n');
+        if (!source_ptr)
+            break;
+        source_ptr++;
+    }
+    for (int i = 0; i < 10 && *source_ptr; i++) {
+        char line[256] = {0};
+        const char *newline = strchr(source_ptr, '\n');
+        if (newline) {
+            strncpy(line, source_ptr, newline - source_ptr);
+        } else {
+            strncpy(line, source_ptr, sizeof(line) - 1);
+        }
+        Color color = (i + start_line == c->cursor.row) ? YELLOW : WHITE;
+        drawText(font, line, 10, 70 + i * 20, color);
+        source_ptr = newline ? newline + 1 : "";
+    }
+}
+
+void drawBuffer(Compiler *c, Font *font, float startX, float startY,
+                float scrollX, float scrollY) {
+    const char *text = c->buffer.content;
+    float x = startX - scrollX;
+    float y = startY + scrollY;
+    Color currentColor = WHITE; // Default color, adjust as needed
+
+    useShader("text");
+
+    for (size_t charIndex = 0; charIndex < c->buffer.size; charIndex++) {
+        if (text[charIndex] == '\n') {
+            x = startX - scrollX;
+            y -= (font->ascent + font->descent);
+            continue;
+        }
+
+        if (charIndex == c->cursor.point) {
+            currentColor = CT.bg; // Highlight color for cursor position
+        } else {
+            currentColor = CT.text; // Default text color
+        }
+
+        drawChar(font, text[charIndex], x, y, 1.0, 1.0, currentColor);
+
+        x += getCharacterWidth(font, text[charIndex]);
+    }
+
+    flush();
+}
+
+void drawCursor(Compiler *c, Font *font, float startX, float startY,
+                float scrollX, float scrollY, Color cursorColor) {
+    float cursorX = startX - scrollX;
+    float cursorY = startY + scrollY;
+    int lineCount = 0;
+
+    for (size_t i = 0; i < c->cursor.point; i++) {
+        if (c->buffer.content[i] == '\n') {
+            lineCount++;
+            cursorX = startX - scrollX;
+        } else {
+            cursorX += getCharacterWidth(font, c->buffer.content[i]);
+        }
+    }
+
+    float cursorWidth =
+        (c->cursor.point < c->buffer.size &&
+         c->buffer.content[c->cursor.point] != '\n')
+        ? getCharacterWidth(font, c->buffer.content[c->cursor.point])
+        : getCharacterWidth(font, ' ');
+
+    cursorY -= lineCount * (font->ascent + font->descent) + (font->descent * 2);
+
+    Vec2f cursorPosition = {cursorX, cursorY};
+    Vec2f cursorSize = {cursorWidth, font->ascent + font->descent};
+
+    useShader("simple");
+    drawRectangle(cursorPosition, cursorSize, cursorColor);
+    flush();
+}
+
+int  fontsize    = 82;
+char *fontPath   = "fan.otf";
+bool should_step = false;
+int  step_count  = 0;
+
+void keyCallback(int key, int action, int mods) {
+    bool shiftPressed = mods & GLFW_MOD_SHIFT;
+    bool ctrlPressed = mods & GLFW_MOD_CONTROL;
+    bool altPressed = mods & GLFW_MOD_ALT;
+    if (action == GLFW_PRESS || action == GLFW_REPEAT) {
+        switch (key) {
+        case KEY_K:
+            printf("Hello, porcodio\n");
+            break;
+        case KEY_SPACE:
+        case KEY_F:
+            should_step = true;
+            break;
+          break;
+        case KEY_MINUS:
+          if (altPressed)
+            previousTheme();
+          break;
+        case KEY_EQUAL:
+            if (altPressed)
+                nextTheme();
+          break;
+        }
+    }
+}
+
+bool read_file(const char *filename, char **content, size_t *size) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        fprintf(stderr, "Error: Could not open file '%s'\n", filename);
+        return false;
+    }
+
+    fseek(file, 0, SEEK_END);
+    *size = ftell(file);
+    rewind(file);
+
+    *content = malloc(*size + 1);
+    if (!*content) {
+        fprintf(stderr, "Error: Memory allocation failed\n");
+        fclose(file);
+        return false;
+    }
+
+    size_t read_size = fread(*content, 1, *size, file);
+    if (read_size != *size) {
+        fprintf(stderr, "Error: Failed to read entire file\n");
+        free(*content);
+        fclose(file);
+        return false;
+    }
+
+    (*content)[*size] = '\0';
+    fclose(file);
+    return true;
+}
+
+int main(int argc, char *argv[]) {
+    bool step_mode = false;
+    const char *source_file_name = NULL;
+    initThemes();
+
+    // Parse command line arguments
+    if (argc == 3 &&
+        (strcmp(argv[1], "-s") == 0 || strcmp(argv[1], "--step") == 0)) {
+        step_mode = true;
+        source_file_name = argv[2];
+    } else if (argc == 2) {
+        source_file_name = argv[1];
+    } else {
+        fprintf(stderr, "Usage: %s [-s|--step] <source_file>\n", argv[0]);
         return 1;
     }
 
     // Read source file
-    FILE* source_file = fopen(argv[1], "r");
-    if (!source_file) {
-        fprintf(stderr, "Error: Could not open file '%s'\n", argv[1]);
+    char *source = NULL;
+    size_t file_size = 0;
+    if (!read_file(source_file_name, &source, &file_size)) {
         return 1;
     }
 
-    // Get file size
-    fseek(source_file, 0, SEEK_END);
-    size_t file_size = ftell(source_file);
-    rewind(source_file);
+    // Initialize compiler
+    Compiler *c = compiler_new(source);
+    if (!c) {
+        fprintf(stderr, "Error: Failed to initialize compiler\n");
+        free(source);
+        return 1;
+    }
 
-    // Read file contents
-    char* source = malloc(file_size + 1);
-    fread(source, 1, file_size, source_file);
-    source[file_size] = '\0';
-    fclose(source_file);
+    if (step_mode) {
+        // Initialize window and input
+        initWindow(sw, sh, "imp - Lex Stepper");
+        registerKeyCallback(keyCallback);
 
-    // Initialize compiler context
-    Compiler* c = compiler_new(source);
+        sw = getScreenWidth();  // NOTE Currently get screen dimentions
+        sh = getScreenHeight(); // only once at startup
 
-    // Compile
-    parse(c);
-    generate_code(c);
+        // Load font
+        Font *font = loadFont(fontPath, fontsize, "fun");
+        if (!font) {
+            fprintf(stderr, "Failed to load font\n");
+            compiler_free(c);
+            free(source);
+            closeWindow();
+            return 1;
+        }
+
+        lex(c); // Initialize the first token
+
+        while (!windowShouldClose()) {
+            updateInput();
+
+            beginDrawing();
+            clearBackground(CT.bg);
+
+            drawCursor(c, font, 0, sh - font->ascent + font->descent, 0, 0, CT.cursor);
+            drawBuffer(c, font, 0, sh - font->ascent + font->descent, 0, 0);
+            drawCompilerState(font, c, step_count);
+
+            if (should_step) {
+                if (c->current_token.type != TOKEN_EOF) {
+                    lex(c);
+                    step_count++;
+                } else {
+                    drawText(font, "Lexical analysis complete", 10, sh - 30, CT.region);
+                }
+                should_step = false;
+            }
+
+            endDrawing();
+        }
+
+        freeFont(font);
+        closeWindow();
+    } else {
+        // Non-step mode: parse and generate code
+        parse(c);
+        generate_code(c);
+
+        // Assemble and link
+        int result = system("nasm -f elf64 output.asm && ld -o a.out output.o");
+        if (result == 0) {
+            printf("Compilation successful. Executable 'a.out' created.\n");
+        } else {
+            fprintf(stderr, "Error: Compilation failed\n");
+        }
+    }
 
     // Cleanup
-    free(source);
     compiler_free(c);
-
-    // Assemble and link
-    system("nasm -f elf64 output.asm");
-    system("ld -o a.out output.o");
-
-    printf("Compilation successful. Executable 'a.out' created.\n");
+    free(source);
 
     return 0;
 }
+

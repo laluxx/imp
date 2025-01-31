@@ -5,3 +5,4 @@ first :: proc() {
 main :: proc() {
     first()
 }
+
