@@ -6,10 +6,9 @@
 #include <ctype.h>
 
 // TODO Tail call optimization.
-// TODO Syntax highlighting
 // TODO Scope of Scopes
 // TODO --return-symbol-at POINT
-// TODO Compilers should also be an lsp's
+// TODO Compilers should also be lsp's
 // TODO Capture tests on the buffer or region
 
 // TODO Frame pointer omission: For simple functions,
@@ -31,6 +30,7 @@ typedef struct {
     size_t row;    // Current line number (1-based)
     size_t col;    // Current column number (1-based)
     size_t point;  // Current position in source
+    size_t line;   // Current line in the buffer
 } Cursor;
 
 typedef struct {
@@ -41,11 +41,26 @@ typedef struct {
 } Buffer;
 
 typedef struct {
+    size_t start;
+    size_t end;
+    Color bg;
+    Color fg;
+} Face;
+
+typedef struct {
     TokenType type;
     char* lexeme;  // The actual text of the token
     size_t row;    // Line number where token appears
     size_t col;    // Column number where token starts
+    size_t line;   // Line of the token
+    Face face;
 } Token;
+
+typedef struct {
+    Token *tokens;
+    size_t count;
+    size_t capacity;
+} TokenHistory;
 
 typedef struct Procedure {
     char* name;               // Name of the procedure
@@ -66,14 +81,18 @@ typedef struct {
     Token current_token;
     Procedures procedures;
     FILE *output_file; // Assembly output file
+    TokenHistory history;
 } Compiler;
+
+bool single_highlight_mode = true;
 
 // Function prototypes
 Cursor cursor_new(const char* source);
 void cursor_advance(Cursor *cursor, Buffer *buffer);
 char cursor_peek(Cursor *cursor, Buffer *buffer);
 bool cursor_is_at_end(Cursor *cursor, Buffer *buffer);
-Token token_new(TokenType type, const char* lexeme, size_t row, size_t col);
+Token token_new(TokenType type, const char *lexeme, size_t row, size_t col,
+                size_t line, size_t start, size_t end);
 Procedure* procedure_new(const char* name);
 void procedure_add_call(Procedure* proc, Procedure* called_proc);
 void procedure_free(Procedure* proc);
@@ -84,20 +103,51 @@ void parse(Compiler* c);
 void generate_code(Compiler* c);
 void error(Compiler* c, const char* message);
 
+void token_history_init(TokenHistory *history);
+void token_history_add(TokenHistory *history, Token token);
+void token_history_free(TokenHistory *history);
+
+void token_history_init(TokenHistory *history) {
+    history->tokens = NULL;
+    history->count = 0;
+    history->capacity = 0;
+}
+
+void token_history_free(TokenHistory *history) {
+    for (size_t i = 0; i < history->count; i++) {
+        free(history->tokens[i].lexeme);
+    }
+    free(history->tokens);
+    history->tokens = NULL;
+    history->count = 0;
+    history->capacity = 0;
+}
+
+void token_history_add(TokenHistory *history, Token token) {
+    if (history->count >= history->capacity) {
+        history->capacity = history->capacity == 0 ? 8 : history->capacity * 2;
+        history->tokens =
+            realloc(history->tokens, history->capacity * sizeof(Token));
+    }
+    history->tokens[history->count++] = token;
+}
+
 // Cursor functions
 Cursor cursor_new(const char* source) {
     Cursor cursor = {
         .row = 1,
         .col = 1,
-        .point = 0
+        .point = 0,
+        .line = 0
     };
     return cursor;
 }
 
-void cursor_advance(Cursor* cursor, Buffer *buffer) {
+void cursor_advance(Cursor *cursor, Buffer *buffer) {
     if (buffer->content[cursor->point] == '\n') {
         cursor->row++;
         cursor->col = 1;
+        cursor->line++;
     } else {
         cursor->col++;
     }
@@ -113,13 +163,39 @@ bool cursor_is_at_end(Cursor* cursor, Buffer *buffer) {
 }
 
 // Token functions
-Token token_new(TokenType type, const char* lexeme, size_t row, size_t col) {
-    Token token = {
-        .type = type,
-        .lexeme = strdup(lexeme),
-        .row = row,
-        .col = col
-    };
+Token token_new(TokenType type, const char *lexeme, size_t row, size_t col,
+                size_t line, size_t start, size_t end) {
+    Color fg;
+    switch (type) {
+    case TOKEN_IDENTIFIER:
+        fg = CT.variable;
+        break;
+    case TOKEN_DOUBLE_COLON:
+        fg = CT.function;
+        break;
+    case TOKEN_PROC:
+        fg = CT.keyword;
+        break;
+    case TOKEN_LPAREN:
+    case TOKEN_RPAREN:
+        fg = CT.preprocessor;
+        break;
+    case TOKEN_LBRACE:
+    case TOKEN_RBRACE:
+        fg = CT.type;
+        break;
+    default:
+        fg = CT.text;
+    }
+
+    Face face = {.start = start, .end = end, .bg = CT.bg, .fg = fg};
+
+    Token token = {.type = type,
+                   .lexeme = strdup(lexeme),
+                   .row = row,
+                   .col = col,
+                   .line = line,
+                   .face = face};
     return token;
 }
 
@@ -157,10 +233,12 @@ Compiler *compiler_new(const char *source) {
     c->cursor.row = 1;
     c->cursor.col = 1;
     c->cursor.point = 0;
+    c->cursor.line = 0;
     c->procedures.array = NULL;
     c->procedures.num = 0;
     c->procedures.capacity = 0;
     c->output_file = NULL;
+    token_history_init(&c->history);
     return c;
 }
 
@@ -174,72 +252,86 @@ void compiler_free(Compiler *c) {
     if (c->output_file) {
         fclose(c->output_file);
     }
+    token_history_free(&c->history);
     free(c);
 }
 
 // Lexer
-void lex(Compiler* c) {
-    char lexeme[256];
-    size_t lexeme_len = 0;
+void lex(Compiler *c) {
+    // Skip whitespace
+    while (isspace(cursor_peek(&c->cursor, &c->buffer))) {
+        cursor_advance(&c->cursor, &c->buffer);
+    }
 
-    while (!cursor_is_at_end(&c->cursor, &c->buffer)) {
-        size_t start_row = c->cursor.row;
-        size_t start_col = c->cursor.col;
-        lexeme_len = 0;
-
-        // Skip whitespace
-        while (isspace(cursor_peek(&c->cursor, &c->buffer))) {
-            cursor_advance(&c->cursor, &c->buffer);
-        }
-
-        if (cursor_is_at_end(&c->cursor, &c->buffer)) {
-            c->current_token = token_new(TOKEN_EOF, "", start_row, start_col);
-            return;
-        }
-
-        char ch = cursor_peek(&c->cursor, &c->buffer);
-
-        if (isalpha(ch) || ch == '_') {
-            // Identifier
-            while (isalnum(cursor_peek(&c->cursor, &c->buffer)) || cursor_peek(&c->cursor, &c->buffer) == '_') {
-                lexeme[lexeme_len++] = cursor_peek(&c->cursor, &c->buffer);
-                cursor_advance(&c->cursor, &c->buffer);
-            }
-            lexeme[lexeme_len] = '\0';
-
-            if (strcmp(lexeme, "proc") == 0) {
-                c->current_token = token_new(TOKEN_PROC, lexeme, start_row, start_col);
-            } else {
-                c->current_token = token_new(TOKEN_IDENTIFIER, lexeme, start_row, start_col);
-            }
-        } else if (ch == ':') {
-            cursor_advance(&c->cursor, &c->buffer);
-            if (cursor_peek(&c->cursor, &c->buffer) == ':') {
-                cursor_advance(&c->cursor, &c->buffer);
-                c->current_token = token_new(TOKEN_DOUBLE_COLON, "::", start_row, start_col);
-            } else {
-                error(c, "Expected ':' after ':'");
-            }
-        } else if (ch == '(') {
-            cursor_advance(&c->cursor, &c->buffer);
-            c->current_token = token_new(TOKEN_LPAREN, "(", start_row, start_col);
-        } else if (ch == ')') {
-            cursor_advance(&c->cursor, &c->buffer);
-            c->current_token = token_new(TOKEN_RPAREN, ")", start_row, start_col);
-        } else if (ch == '{') {
-            cursor_advance(&c->cursor, &c->buffer);
-            c->current_token = token_new(TOKEN_LBRACE, "{", start_row, start_col);
-        } else if (ch == '}') {
-            cursor_advance(&c->cursor, &c->buffer);
-            c->current_token = token_new(TOKEN_RBRACE, "}", start_row, start_col);
-        } else {
-            error(c, "Unexpected character");
-        }
-
+    // Check for end of file
+    if (cursor_is_at_end(&c->cursor, &c->buffer)) {
+        size_t end_pos = c->cursor.point;
+        c->current_token = token_new(TOKEN_EOF, "", c->cursor.row, c->cursor.col,
+                                     c->cursor.line, end_pos, end_pos);
+        token_history_add(&c->history, c->current_token);
         return;
     }
 
-    c->current_token = token_new(TOKEN_EOF, "", c->cursor.row, c->cursor.col);
+    size_t start_row = c->cursor.row;
+    size_t start_col = c->cursor.col;
+    size_t start_line = c->cursor.line;
+    size_t start_pos = c->cursor.point;
+    char ch = cursor_peek(&c->cursor, &c->buffer);
+
+    if (isalpha(ch) || ch == '_') {
+        // Identifier or keyword
+        char lexeme[256];
+        size_t lexeme_len = 0;
+        while (isalnum(cursor_peek(&c->cursor, &c->buffer)) ||
+               cursor_peek(&c->cursor, &c->buffer) == '_') {
+            lexeme[lexeme_len++] = cursor_peek(&c->cursor, &c->buffer);
+            cursor_advance(&c->cursor, &c->buffer);
+        }
+        lexeme[lexeme_len] = '\0';
+        size_t end_pos = c->cursor.point;
+
+        if (strcmp(lexeme, "proc") == 0) {
+            c->current_token = token_new(TOKEN_PROC, lexeme, start_row, start_col,
+                                         start_line, start_pos, end_pos);
+        } else {
+            c->current_token = token_new(TOKEN_IDENTIFIER, lexeme, start_row,
+                                         start_col, start_line, start_pos, end_pos);
+        }
+    } else if (ch == ':') {
+        cursor_advance(&c->cursor, &c->buffer);
+        if (cursor_peek(&c->cursor, &c->buffer) == ':') {
+            cursor_advance(&c->cursor, &c->buffer);
+            size_t end_pos = c->cursor.point;
+            c->current_token = token_new(TOKEN_DOUBLE_COLON, "::", start_row,
+                                         start_col, start_line, start_pos, end_pos);
+        } else {
+            error(c, "Expected ':' after ':'");
+        }
+    } else if (ch == '(') {
+        cursor_advance(&c->cursor, &c->buffer);
+        size_t end_pos = c->cursor.point;
+        c->current_token = token_new(TOKEN_LPAREN, "(", start_row, start_col,
+                                     start_line, start_pos, end_pos);
+    } else if (ch == ')') {
+        cursor_advance(&c->cursor, &c->buffer);
+        size_t end_pos = c->cursor.point;
+        c->current_token = token_new(TOKEN_RPAREN, ")", start_row, start_col,
+                                     start_line, start_pos, end_pos);
+    } else if (ch == '{') {
+        cursor_advance(&c->cursor, &c->buffer);
+        size_t end_pos = c->cursor.point;
+        c->current_token = token_new(TOKEN_LBRACE, "{", start_row, start_col,
+                                     start_line, start_pos, end_pos);
+    } else if (ch == '}') {
+        cursor_advance(&c->cursor, &c->buffer);
+        size_t end_pos = c->cursor.point;
+        c->current_token = token_new(TOKEN_RBRACE, "}", start_row, start_col,
+                                     start_line, start_pos, end_pos);
+    } else {
+        error(c, "Unexpected character");
+    }
+
+    token_history_add(&c->history, c->current_token);
 }
 
 // Parser
@@ -412,60 +504,157 @@ void drawCompilerState(Font *font, Compiler *c, int step_count) {
     drawText(font, state_info, 10, 40, CT.text);
 }
 
-void drawSourceCode(Font *font, Compiler *c, const char *source) {
-    int start_line = (int)c->cursor.row - 5;
-    if (start_line < 1)
-        start_line = 1;
-    const char *source_ptr = source;
-    for (int i = 1; i < start_line; i++) {
-        source_ptr = strchr(source_ptr, '\n');
-        if (!source_ptr)
-            break;
-        source_ptr++;
-    }
-    for (int i = 0; i < 10 && *source_ptr; i++) {
-        char line[256] = {0};
-        const char *newline = strchr(source_ptr, '\n');
-        if (newline) {
-            strncpy(line, source_ptr, newline - source_ptr);
-        } else {
-            strncpy(line, source_ptr, sizeof(line) - 1);
-        }
-        Color color = (i + start_line == c->cursor.row) ? YELLOW : WHITE;
-        drawText(font, line, 10, 70 + i * 20, color);
-        source_ptr = newline ? newline + 1 : "";
-    }
-}
-
 void drawBuffer(Compiler *c, Font *font, float startX, float startY,
                 float scrollX, float scrollY) {
+    if (!c || !font || !c->buffer.content)
+        return;
+
     const char *text = c->buffer.content;
     float x = startX - scrollX;
     float y = startY + scrollY;
-    Color currentColor = WHITE; // Default color, adjust as needed
+    size_t charIndex = 0;
+    size_t tokenIndex = 0;
 
     useShader("text");
 
-    for (size_t charIndex = 0; charIndex < c->buffer.size; charIndex++) {
+    while (charIndex < c->buffer.size) {
         if (text[charIndex] == '\n') {
             x = startX - scrollX;
             y -= (font->ascent + font->descent);
+            charIndex++;
             continue;
         }
+
+        Color currentColor = CT.text; // Default color
 
         if (charIndex == c->cursor.point) {
             currentColor = CT.bg; // Highlight color for cursor position
         } else {
-            currentColor = CT.text; // Default text color
+            if (single_highlight_mode) {
+                // Only highlight the current token
+                if (charIndex >= c->current_token.face.start &&
+                    charIndex < c->current_token.face.end) {
+                    currentColor = c->current_token.face.fg;
+                }
+            } else {
+                // Highlight all tokens
+                while (tokenIndex < c->history.count &&
+                       charIndex >= c->history.tokens[tokenIndex].face.end) {
+                    tokenIndex++;
+                }
+
+                if (tokenIndex < c->history.count &&
+                    charIndex >= c->history.tokens[tokenIndex].face.start &&
+                    charIndex < c->history.tokens[tokenIndex].face.end) {
+                    currentColor = c->history.tokens[tokenIndex].face.fg;
+                }
+            }
         }
 
         drawChar(font, text[charIndex], x, y, 1.0, 1.0, currentColor);
 
         x += getCharacterWidth(font, text[charIndex]);
+        charIndex++;
     }
 
     flush();
 }
+
+/* void drawBuffer(Compiler *c, Font *font, float startX, float startY, */
+/*                 float scrollX, float scrollY) { */
+/*     if (!c || !font || !c->buffer.content) */
+/*         return; */
+
+/*     const char *text = c->buffer.content; */
+/*     float x = startX - scrollX; */
+/*     float y = startY + scrollY; */
+/*     size_t charIndex = 0; */
+/*     size_t tokenIndex = 0; */
+
+/*     useShader("text"); */
+
+/*     while (charIndex < c->buffer.size) { */
+/*         if (text[charIndex] == '\n') { */
+/*             x = startX - scrollX; */
+/*             y -= (font->ascent + font->descent); */
+/*             charIndex++; */
+/*             continue; */
+/*         } */
+
+/*         Color currentColor = CT.text; // Default color */
+
+/*         if (single_highlight_mode) { */
+/*             // Only highlight the current token */
+/*             if (charIndex >= c->current_token.face.start && */
+/*                 charIndex < c->current_token.face.end) { */
+/*                 currentColor = c->current_token.face.fg; */
+/*             } */
+/*         } else { */
+/*             // Highlight all tokens */
+/*             while (tokenIndex < c->history.count && */
+/*                    charIndex >= c->history.tokens[tokenIndex].face.end) { */
+/*                 tokenIndex++; */
+/*             } */
+
+/*             if (tokenIndex < c->history.count && */
+/*                 charIndex >= c->history.tokens[tokenIndex].face.start && */
+/*                 charIndex < c->history.tokens[tokenIndex].face.end) { */
+/*                 currentColor = c->history.tokens[tokenIndex].face.fg; */
+/*             } */
+/*         } */
+
+/*         drawChar(font, text[charIndex], x, y, 1.0, 1.0, currentColor); */
+
+/*         x += getCharacterWidth(font, text[charIndex]); */
+/*         charIndex++; */
+/*     } */
+
+/*     flush(); */
+/* } */
+
+/* void drawBuffer(Compiler *c, Font *font, float startX, float startY, */
+/*                 float scrollX, float scrollY) { */
+/*     if (!c || !font || !c->buffer.content) */
+/*         return; */
+
+/*     const char *text = c->buffer.content; */
+/*     float x = startX - scrollX; */
+/*     float y = startY + scrollY; */
+/*     size_t charIndex = 0; */
+/*     size_t tokenIndex = 0; */
+
+/*     useShader("text"); */
+
+/*     while (charIndex < c->buffer.size) { */
+/*         if (text[charIndex] == '\n') { */
+/*             x = startX - scrollX; */
+/*             y -= (font->ascent + font->descent); */
+/*             charIndex++; */
+/*             continue; */
+/*         } */
+
+/*         Color currentColor = CT.text; // Default color */
+
+/*         // Find the current token */
+/*         while (tokenIndex < c->history.count && */
+/*                charIndex >= c->history.tokens[tokenIndex].face.end) { */
+/*             tokenIndex++; */
+/*         } */
+
+/*         if (tokenIndex < c->history.count && */
+/*             charIndex >= c->history.tokens[tokenIndex].face.start && */
+/*             charIndex < c->history.tokens[tokenIndex].face.end) { */
+/*             currentColor = c->history.tokens[tokenIndex].face.fg; */
+/*         } */
+
+/*         drawChar(font, text[charIndex], x, y, 1.0, 1.0, currentColor); */
+
+/*         x += getCharacterWidth(font, text[charIndex]); */
+/*         charIndex++; */
+/*     } */
+
+/*     flush(); */
+/* } */
 
 void drawCursor(Compiler *c, Font *font, float startX, float startY,
                 float scrollX, float scrollY, Color cursorColor) {
@@ -509,21 +698,21 @@ void keyCallback(int key, int action, int mods) {
     bool altPressed = mods & GLFW_MOD_ALT;
     if (action == GLFW_PRESS || action == GLFW_REPEAT) {
         switch (key) {
-        case KEY_K:
-            printf("Hello, porcodio\n");
-            break;
+        case KEY_J:
+        case KEY_N:
         case KEY_SPACE:
         case KEY_F:
             should_step = true;
             break;
           break;
         case KEY_MINUS:
-          if (altPressed)
             previousTheme();
           break;
+        case KEY_H:
+            single_highlight_mode = !single_highlight_mode;
+          break;
         case KEY_EQUAL:
-            if (altPressed)
-                nextTheme();
+            nextTheme();
           break;
         }
     }
@@ -617,6 +806,7 @@ int main(int argc, char *argv[]) {
 
             beginDrawing();
             clearBackground(CT.bg);
+
 
             drawCursor(c, font, 0, sh - font->ascent + font->descent, 0, 0, CT.cursor);
             drawBuffer(c, font, 0, sh - font->ascent + font->descent, 0, 0);
